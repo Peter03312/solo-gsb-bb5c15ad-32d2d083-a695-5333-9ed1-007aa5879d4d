@@ -144,6 +144,36 @@ class WaitlistTokenIn(BaseModel):
     query_token: str | None = None
 
 
+class LockCreateIn(BaseModel):
+    """Slot lock (名额锁定) request: UTC window + client idempotency key.
+
+    The window follows the same booking policy as a single reservation
+    (lead time, duration, one continuous open interval of the currently
+    published calendar, spare capacity); the lock itself lives for the
+    server-side confirmation TTL (default 10 minutes).
+    """
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T09:00:00Z)"
+            )
+        return value
+
+
+class LockConfirmIn(BaseModel):
+    """Body of the lock confirmation endpoint: the capability token."""
+
+    confirm_token: str | None = None
+
+
 class ReservationReassignIn(BaseModel):
     """Reassign (改派) request: move a visit to another recycling point.
 
@@ -478,6 +508,28 @@ class WaitlistOut(BaseModel):
     end: str
     rules_version: int
     query_token: str
+    created_at: datetime
+    reservation: ReservationOut | None = None
+
+
+class LockOut(BaseModel):
+    """Slot lock (名额锁定) state returned by create / replay / confirm.
+
+    ``status`` is ``locked`` (valid, holding one slot until ``expires_at``),
+    ``confirmed`` (converted into the embedded reservation) or ``expired``
+    (deadline passed without confirmation; no longer occupies capacity).
+    Once confirmed, ``reservation`` carries the live reservation snapshot
+    (including the cancel token needed to cancel or reschedule it).
+    """
+
+    id: int
+    point_id: int
+    status: str
+    start: str
+    end: str
+    rules_version: int
+    confirm_token: str
+    expires_at: datetime
     created_at: datetime
     reservation: ReservationOut | None = None
 

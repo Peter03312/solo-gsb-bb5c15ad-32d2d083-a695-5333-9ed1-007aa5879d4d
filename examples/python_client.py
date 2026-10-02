@@ -734,6 +734,105 @@ def main() -> None:
     )
     show("second applicant promoted", status, b_state)
 
+    # ------------------------------------------------------------------
+    # Slot locks (到访名额锁定): hold one slot for the confirmation TTL
+    # (default 10 minutes), then confirm it into an ordinary reservation.
+    # The window follows the single-reservation booking policy; a valid
+    # (unexpired, unconfirmed) lock counts as one slot everywhere —
+    # reservations, trips, plan search and the waitlist.
+    # ------------------------------------------------------------------
+    status, lock_point = call(
+        "POST", "/points", {"name": "锁定演示点", "timezone": "UTC"}
+    )
+    show("create a point for slot locks", status, lock_point)
+    lpid = lock_point["id"]
+    call(
+        "POST",
+        f"/points/{lpid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": weekday, "start_time": "08:00", "end_time": "12:00"}
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+
+    lock_body = {
+        "idempotency_key": "lock-demo-1",
+        "start": f"{tomorrow}T09:00:00Z",
+        "end": f"{tomorrow}T09:30:00Z",
+    }
+    status, held = call("POST", f"/points/{lpid}/locks", lock_body)
+    show(
+        "apply for a slot lock (201: number + confirm token + deadline)",
+        status,
+        held,
+    )
+    lid = held["id"]
+    confirm_token = held["confirm_token"]
+
+    status, clash = call(
+        "POST",
+        f"/points/{lpid}/reservations",
+        {
+            "idempotency_key": "lock-clash",
+            "start": f"{tomorrow}T09:00:00Z",
+            "end": f"{tomorrow}T09:30:00Z",
+        },
+    )
+    show("the valid lock occupies the slot (409 reservation_overlap)", status, clash)
+
+    status, replay = call("POST", f"/points/{lpid}/locks", lock_body)
+    show("same key + same content replays the lock (200)", status, replay)
+    status, lock_conflict = call(
+        "POST",
+        f"/points/{lpid}/locks",
+        {
+            "idempotency_key": "lock-demo-1",
+            "start": f"{tomorrow}T09:00:00Z",
+            "end": f"{tomorrow}T10:00:00Z",
+        },
+    )
+    show("same key + different content conflicts (409)", status, lock_conflict)
+
+    status, confirmed = call(
+        "POST",
+        f"/points/{lpid}/locks/{lid}/confirm",
+        {"confirm_token": confirm_token},
+    )
+    show(
+        "confirm before the deadline: lock becomes a reservation (200)",
+        status,
+        confirmed,
+    )
+    converted = confirmed["reservation"]
+
+    status, again = call(
+        "POST",
+        f"/points/{lpid}/locks/{lid}/confirm",
+        {"confirm_token": confirm_token},
+    )
+    show(
+        "repeating the confirm returns the same reservation (200)",
+        status,
+        again,
+    )
+    assert again["reservation"]["id"] == converted["id"]
+
+    status, cancelled = call(
+        "POST",
+        f"/points/{lpid}/reservations/{converted['id']}/cancel",
+        {"cancel_token": converted["cancel_token"]},
+    )
+    show("the converted reservation cancels with its own token", status, cancelled)
+    # A lock left unconfirmed past its expires_at deadline stops occupying:
+    # confirming it then fails with 409 lock_expired, and the next
+    # capacity-touching write sweeps it and promotes the waitlist.
+
 
 if __name__ == "__main__":
     main()

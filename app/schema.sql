@@ -200,3 +200,34 @@ CREATE TABLE IF NOT EXISTS trip_stops (
 
 CREATE INDEX IF NOT EXISTS idx_trip_stops_reservation
     ON trip_stops (reservation_id);
+
+-- Visit slot locks (到访名额锁定).  A lock holds one capacity slot of its
+-- window for a short confirmation TTL (default 10 minutes); confirming with
+-- the confirm_token before expiry atomically converts it into an ordinary
+-- reservation.  (point_id, idempotency_key) is the idempotency scope, with
+-- the same first-successful-request-wins semantics as reservations.
+--
+-- status lifecycle:
+--   locked    -- valid and occupying one slot until expires_at
+--   confirmed -- converted into a reservation (reservation_id set), exactly once
+--   expired   -- not confirmed before expires_at; no longer occupies capacity
+CREATE TABLE IF NOT EXISTS slot_locks (
+    id              BIGSERIAL PRIMARY KEY,
+    point_id        BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    start_utc       TIMESTAMPTZ NOT NULL,
+    end_utc         TIMESTAMPTZ NOT NULL,
+    rules_version   INTEGER NOT NULL,        -- published version validated at lock time
+    confirm_token   TEXT NOT NULL,           -- capability token for confirmation
+    status          TEXT NOT NULL DEFAULT 'locked'
+                    CHECK (status IN ('locked', 'confirmed', 'expired')),
+    expires_at      TIMESTAMPTZ NOT NULL,    -- confirmation deadline (lock TTL)
+    reservation_id  BIGINT REFERENCES reservations(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (point_id, idempotency_key)
+);
+
+-- Capacity queries count valid locks (status 'locked' and expires_at in the
+-- future) alongside active reservations; this partial index serves them.
+CREATE INDEX IF NOT EXISTS idx_slot_locks_point_locked
+    ON slot_locks (point_id, start_utc) WHERE status = 'locked';

@@ -607,3 +607,81 @@ api POST /trips/plan "{
   \"search_from\": \"${D1}T00:00:00Z\",
   \"search_to\": \"${D8}T00:00:00Z\"
 }"
+
+echo
+echo "== 12. Slot locks (名额锁定): hold one slot for 10 minutes, then confirm =="
+# A dedicated point for the lock walk-through.
+LPOINT_JSON="$(api POST /points '{"name":"锁定演示点","timezone":"UTC"}')"
+echo "$LPOINT_JSON"
+LPID="$(echo "$LPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$LPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+
+echo
+echo "-- apply for a slot lock on 09:00-09:30 (201: number + confirm token + deadline) --"
+LOCK_JSON="$(api POST "/points/$LPID/locks" "{
+  \"idempotency_key\": \"demo-lock-1\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}")"
+echo "$LOCK_JSON"
+LID="$(echo "$LOCK_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+LTOKEN="$(echo "$LOCK_JSON" | sed -n 's/.*"confirm_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- the valid lock occupies the slot: an overlapping reservation is refused (409) --"
+api POST "/points/$LPID/reservations" "{
+  \"idempotency_key\": \"demo-lock-clash\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}"
+
+echo
+echo "-- same key + same content replays the lock (200); different content conflicts (409) --"
+api POST "/points/$LPID/locks" "{
+  \"idempotency_key\": \"demo-lock-1\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}"
+api POST "/points/$LPID/locks" "{
+  \"idempotency_key\": \"demo-lock-1\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T10:00:00Z\"
+}"
+
+echo
+echo "-- confirm before the deadline: the lock atomically becomes a reservation (200) --"
+CONFIRM_JSON="$(api POST "/points/$LPID/locks/$LID/confirm" "{\"confirm_token\":\"$LTOKEN\"}")"
+echo "$CONFIRM_JSON"
+CONF_RID="$(echo "$CONFIRM_JSON" | grep -o '"reservation":{"id":[0-9]*' | head -1 | grep -o '[0-9]*$')"
+CONF_TOKEN="$(echo "$CONFIRM_JSON" | grep -o '"cancel_token":"[^"]*"' | head -1 | cut -d'"' -f4)"
+
+echo
+echo "-- repeating the confirm returns the same reservation (200, no extension) --"
+api POST "/points/$LPID/locks/$LID/confirm" "{\"confirm_token\":\"$LTOKEN\"}"
+
+echo
+echo "-- the converted reservation occupies the window and cancels with its own token --"
+api POST "/points/$LPID/reservations" "{
+  \"idempotency_key\": \"demo-lock-clash-2\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}"
+api POST "/points/$LPID/reservations/$CONF_RID/cancel" "{\"cancel_token\":\"$CONF_TOKEN\"}"
+
+echo
+echo "-- after cancellation the window is free again (201) --"
+api POST "/points/$LPID/reservations" "{
+  \"idempotency_key\": \"demo-lock-after\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T09:30:00Z\"
+}"
+# Note: a lock left unconfirmed past its expires_at deadline (10 minutes by
+# default) stops occupying; confirming it then fails with 409 lock_expired,
+# and the next capacity-touching write sweeps it and promotes the waitlist.

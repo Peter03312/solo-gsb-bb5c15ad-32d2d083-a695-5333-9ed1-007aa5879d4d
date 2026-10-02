@@ -14,7 +14,9 @@ from psycopg_pool import ConnectionPool
 
 from .errors import (
     InvalidCancelTokenError,
+    InvalidConfirmTokenError,
     InvalidWaitlistTokenError,
+    LockNotFoundError,
     NotFoundError,
     NoPublishedVersionError,
     ReservationChangeConflictError,
@@ -305,9 +307,13 @@ def get_active_reservation_windows(
     point_id: int,
     window_from: datetime,
     window_to: datetime,
+    now: datetime,
 ) -> list[tuple[datetime, datetime]]:
-    """``(start_utc, end_utc)`` of active reservations overlapping a window.
+    """``(start_utc, end_utc)`` of occupancy windows overlapping a window.
 
+    Occupancy means active (non-cancelled) reservations plus *valid* slot
+    locks (status ``locked`` whose confirmation deadline ``expires_at`` is
+    still in the future at ``now``); an expired lock no longer occupies.
     Mirrors :func:`find_overlapping`'s strict half-open inequalities (visits
     that merely touch the window edges never constrain it), but returns all
     rows — the planner needs every boundary inside the span to reconstruct
@@ -318,8 +324,21 @@ def get_active_reservation_windows(
         for row in cur.execute(
             "SELECT start_utc, end_utc FROM reservations "
             "WHERE point_id = %s AND status = 'active' "
-            "AND start_utc < %s AND end_utc > %s ORDER BY start_utc, end_utc",
-            (point_id, window_to, window_from),
+            "AND start_utc < %s AND end_utc > %s "
+            "UNION ALL "
+            "SELECT start_utc, end_utc FROM slot_locks "
+            "WHERE point_id = %s AND status = 'locked' AND expires_at > %s "
+            "AND start_utc < %s AND end_utc > %s "
+            "ORDER BY start_utc, end_utc",
+            (
+                point_id,
+                window_to,
+                window_from,
+                point_id,
+                now,
+                window_to,
+                window_from,
+            ),
         ).fetchall()
     ]
 
@@ -440,51 +459,86 @@ def find_overlapping(
     ).fetchall()
 
 
+def find_overlapping_locks(
+    cur: psycopg.Cursor,
+    point_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    now: datetime,
+) -> list[dict]:
+    """Valid slot locks overlapping ``[start_utc, end_utc)`` (half-open).
+
+    A lock is *valid* — and therefore occupies one slot — while its status is
+    ``locked`` and its confirmation deadline has not passed at ``now``.
+    """
+    return cur.execute(
+        "SELECT id, start_utc, end_utc FROM slot_locks "
+        "WHERE point_id = %s AND status = 'locked' AND expires_at > %s "
+        "AND start_utc < %s AND end_utc > %s ORDER BY id",
+        (point_id, now, end_utc, start_utc),
+    ).fetchall()
+
+
+def _occupancy_source(exclude_reservation_id: int | None) -> str:
+    """SQL fragment selecting every ``(start_utc, end_utc)`` occupancy window.
+
+    Occupancy = active reservations (optionally excluding one, when
+    rescheduling) plus valid slot locks.  Used as a subquery/CTE by the peak
+    concurrency probes; expects ``%(point_id)s`` and ``%(now)s`` params (and
+    ``%(exclude_id)s`` when an exclusion is requested).
+    """
+    exclude_clause = ""
+    if exclude_reservation_id is not None:
+        exclude_clause = "AND id <> %(exclude_id)s"
+    return (
+        "SELECT start_utc, end_utc FROM reservations "
+        f"WHERE point_id = %(point_id)s AND status = 'active' {exclude_clause} "
+        "UNION ALL "
+        "SELECT start_utc, end_utc FROM slot_locks "
+        "WHERE point_id = %(point_id)s AND status = 'locked' "
+        "AND expires_at > %(now)s"
+    )
+
+
 def window_peak_concurrency(
     cur: psycopg.Cursor,
     point_id: int,
     start_utc: datetime,
     end_utc: datetime,
     *,
+    now: datetime,
     exclude_reservation_id: int | None = None,
 ) -> int:
-    """Peak number of active reservations covering any instant of the window.
+    """Peak occupancy covering any instant of the window.
 
-    Capacity is computed over the half-open window ``[start_utc, end_utc)``:
-    a reservation is occupied on ``[start_utc, end_utc)`` and touching is
-    free (an end exactly at an instant is released before a start at that
-    same instant).  The concurrency can only change at a reservation start,
-    so the maximum is taken at the window start and at every reservation
-    start lying inside the window — reservations that began before the
-    window and continue into it are counted at the window start.  When
-    rescheduling, the reservation's own row is ignored.
+    Occupancy counts active reservations and valid slot locks (one slot each)
+    by the half-open interval rule: a visit occupies ``[start_utc, end_utc)``
+    and touching is free (an end exactly at an instant is released before a
+    start at that same instant).  The concurrency can only change at a window
+    start, so the maximum is taken at the window start and at every occupancy
+    start lying inside the window — windows that began before and continue
+    into it are counted at the window start.  When rescheduling, the
+    reservation's own row is ignored.
     """
-    exclude_clause = ""
-    params: list = [point_id]
+    params: dict = {"point_id": point_id, "now": now}
     if exclude_reservation_id is not None:
-        exclude_clause = "AND id <> %s"
-        params.append(exclude_reservation_id)
+        params["exclude_id"] = exclude_reservation_id
+    occupancy = _occupancy_source(exclude_reservation_id)
     initial = cur.execute(
-        "SELECT COUNT(*) AS n FROM reservations "
-        f"WHERE point_id = %s AND status = 'active' {exclude_clause} "
-        "AND start_utc <= %s AND end_utc > %s",
-        (*params, start_utc, start_utc),
+        f"SELECT COUNT(*) AS n FROM ({occupancy}) o "
+        "WHERE o.start_utc <= %(start)s AND o.end_utc > %(start)s",
+        {**params, "start": start_utc},
     ).fetchone()["n"]
     peak = cur.execute(
-        "WITH starts AS ("
-        "  SELECT start_utc AS t FROM reservations "
-        f"  WHERE point_id = %s AND status = 'active' {exclude_clause} "
-        "    AND start_utc >= %s AND start_utc < %s"
-        ") "
+        f"WITH occupancy AS ({occupancy}) "
         "SELECT COALESCE(MAX(c), 0) AS peak FROM ("
         "  SELECT s.t, "
-        "    (SELECT COUNT(*) FROM reservations r "
-        f"    WHERE r.point_id = %s AND r.status = 'active' {exclude_clause} "
-        "      AND r.start_utc <= s.t AND r.end_utc > s.t"
-        ") AS c"
-        "  FROM starts s"
+        "    (SELECT COUNT(*) FROM occupancy o "
+        "     WHERE o.start_utc <= s.t AND o.end_utc > s.t) AS c "
+        "  FROM (SELECT start_utc AS t FROM occupancy "
+        "        WHERE start_utc >= %(start)s AND start_utc < %(end)s) s"
         ") counted",
-        (*params, start_utc, end_utc, *params),
+        {**params, "start": start_utc, "end": end_utc},
     ).fetchone()["peak"]
     return max(initial, peak)
 
@@ -492,31 +546,31 @@ def window_peak_concurrency(
 def future_peak_concurrency(
     cur: psycopg.Cursor, point_id: int, now: datetime
 ) -> int:
-    """Peak active concurrency at any instant ``t >= now`` (future or ongoing).
+    """Peak occupancy at any instant ``t >= now`` (future or ongoing).
 
     Used to validate a capacity decrease: the new capacity must exceed the
-    concurrency at every instant not yet finished.  End events before start
-    events at equal timestamps keep touching reservations compatible.
+    occupancy — active reservations *and* valid slot locks, so a decrease can
+    never invalidate a live lock — at every instant not yet finished.  End
+    events before start events at equal timestamps keep touching windows
+    compatible.
     """
+    occupancy = _occupancy_source(None)
+    params = {"point_id": point_id, "now": now}
     initial = cur.execute(
-        "SELECT COUNT(*) AS n FROM reservations "
-        "WHERE point_id = %s AND status = 'active' "
-        "AND start_utc <= %s AND end_utc > %s",
-        (point_id, now, now),
+        f"SELECT COUNT(*) AS n FROM ({occupancy}) o "
+        "WHERE o.start_utc <= %(now)s AND o.end_utc > %(now)s",
+        params,
     ).fetchone()["n"]
     peak = cur.execute(
-        "WITH starts AS ("
-        "  SELECT start_utc AS t FROM reservations "
-        "  WHERE point_id = %s AND status = 'active' AND start_utc > %s"
-        ") "
+        f"WITH occupancy AS ({occupancy}) "
         "SELECT COALESCE(MAX(c), 0) AS peak FROM ("
         "  SELECT s.t, "
-        "    (SELECT COUNT(*) FROM reservations r "
-        "    WHERE r.point_id = %s AND r.status = 'active' "
-        "      AND r.start_utc <= s.t AND r.end_utc > s.t) AS c"
-        "  FROM starts s"
+        "    (SELECT COUNT(*) FROM occupancy o "
+        "     WHERE o.start_utc <= s.t AND o.end_utc > s.t) AS c "
+        "  FROM (SELECT start_utc AS t FROM occupancy "
+        "        WHERE start_utc > %(now)s) s"
         ") counted",
-        (point_id, now, point_id),
+        params,
     ).fetchone()["peak"]
     return max(initial, peak)
 
@@ -663,12 +717,14 @@ def insert_reassign(
 def assert_reservations_fit(
     cur: psycopg.Cursor, point_id: int, timezone_name: str, payload: dict
 ) -> None:
-    """Refuse a rule/timezone change that un-covers active reservations.
+    """Refuse a rule/timezone change that un-covers reservations or locks.
 
-    Every not-yet-finished, non-cancelled reservation must remain fully
-    inside one continuous open interval of the calendar produced by
-    ``payload`` interpreted in ``timezone_name``.  Callers hold the point
-    row lock, so this check is race-free against concurrent reservations.
+    Every not-yet-finished, non-cancelled reservation and every *valid* slot
+    lock (unexpired, unconfirmed) must remain fully inside one continuous
+    open interval of the calendar produced by ``payload`` interpreted in
+    ``timezone_name`` — a calendar or timezone change may not invalidate a
+    live lock either.  Callers hold the point row lock, so this check is
+    race-free against concurrent reservations and locks.
     """
     now = datetime.now(timezone.utc)
     rows = cur.execute(
@@ -676,25 +732,39 @@ def assert_reservations_fit(
         "WHERE point_id = %s AND status = 'active' AND end_utc > %s ORDER BY id",
         (point_id, now),
     ).fetchall()
-    if not rows:
+    lock_rows = cur.execute(
+        "SELECT id, start_utc, end_utc FROM slot_locks "
+        "WHERE point_id = %s AND status = 'locked' AND expires_at > %s "
+        "AND end_utc > %s ORDER BY id",
+        (point_id, now, now),
+    ).fetchall()
+    if not rows and not lock_rows:
         return
     zone = get_zone(timezone_name)
     ruleset = payload_to_ruleset(payload)
-    date_from = min(r["start_utc"] for r in rows).astimezone(zone).date()
-    date_to = max(r["end_utc"] for r in rows).astimezone(zone).date()
+    all_rows = list(rows) + list(lock_rows)
+    date_from = min(r["start_utc"] for r in all_rows).astimezone(zone).date()
+    date_to = max(r["end_utc"] for r in all_rows).astimezone(zone).date()
     intervals = build_open_intervals(
         timezone_name, ruleset, date_from - timedelta(days=1), date_to + timedelta(days=1)
     )
-    violating = [
-        r["id"]
-        for r in rows
-        if not any(s <= r["start_utc"] and r["end_utc"] <= e for s, e in intervals)
-    ]
-    if violating:
+
+    def _uncovered(row: dict) -> bool:
+        return not any(
+            s <= row["start_utc"] and row["end_utc"] <= e for s, e in intervals
+        )
+
+    violating = [r["id"] for r in rows if _uncovered(r)]
+    violating_locks = [r["id"] for r in lock_rows if _uncovered(r)]
+    if violating or violating_locks:
         raise ReservationChangeConflictError(
-            f"{len(violating)} active reservation(s) of point {point_id} would "
+            f"{len(violating)} active reservation(s) and "
+            f"{len(violating_locks)} valid lock(s) of point {point_id} would "
             f"no longer be fully open under the proposed change",
-            details={"conflicting_reservation_ids": violating},
+            details={
+                "conflicting_reservation_ids": violating,
+                "conflicting_lock_ids": violating_locks,
+            },
         )
 
 
@@ -861,12 +931,12 @@ def promote_waitlist(
             point["timezone"], ruleset, date_from, date_to
         )
         is_open = any(s <= start and end <= e for s, e in intervals)
-        # Against the post-release set of active reservations — including any
-        # waitlist entries promoted earlier in this same sweep — the window
-        # must keep every instant of [start, end) strictly below capacity.
-        # Touching is free, so an interval ending exactly at ``start`` does
-        # not count against the entry.
-        peak = window_peak_concurrency(cur, point_id, start, end)
+        # Against the post-release occupancy — active reservations, valid
+        # locks and any waitlist entries promoted earlier in this same sweep —
+        # the window must keep every instant of [start, end) strictly below
+        # capacity.  Touching is free, so an interval ending exactly at
+        # ``start`` does not count against the entry.
+        peak = window_peak_concurrency(cur, point_id, start, end, now=now)
         if not is_open or peak >= capacity:
             # Not currently promotable: leave it in the queue and keep
             # checking later applicants — one of them may already fit.
@@ -891,6 +961,113 @@ def promote_waitlist(
             ).fetchone()
         )
     return promoted
+
+
+# ---------------------------------------------------------------------------
+# Slot locks (到访名额锁定) — short-TTL capacity holds confirmed into bookings
+# ---------------------------------------------------------------------------
+
+_LOCK_COLS = (
+    "id, point_id, idempotency_key, start_utc, end_utc, rules_version, "
+    "confirm_token, status, expires_at, reservation_id, created_at"
+)
+
+
+def insert_lock(
+    cur: psycopg.Cursor,
+    point_id: int,
+    idempotency_key: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    rules_version: int,
+    expires_at: datetime,
+) -> dict:
+    return cur.execute(
+        f"INSERT INTO slot_locks "
+        f"(point_id, idempotency_key, start_utc, end_utc, rules_version, "
+        f" confirm_token, expires_at) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_LOCK_COLS}",
+        (
+            point_id,
+            idempotency_key,
+            start_utc,
+            end_utc,
+            rules_version,
+            secrets.token_urlsafe(32),
+            expires_at,
+        ),
+    ).fetchone()
+
+
+def get_lock_by_key(
+    cur: psycopg.Cursor, point_id: int, idempotency_key: str
+) -> dict | None:
+    return cur.execute(
+        f"SELECT {_LOCK_COLS} FROM slot_locks "
+        "WHERE point_id = %s AND idempotency_key = %s",
+        (point_id, idempotency_key),
+    ).fetchone()
+
+
+def get_lock_for_update(
+    cur: psycopg.Cursor, point_id: int, lock_id: int
+) -> dict:
+    """Lock the slot-lock row and return it, or raise 404."""
+    row = cur.execute(
+        f"SELECT {_LOCK_COLS} FROM slot_locks "
+        "WHERE id = %s AND point_id = %s FOR UPDATE",
+        (lock_id, point_id),
+    ).fetchone()
+    if row is None:
+        raise LockNotFoundError(
+            f"lock {lock_id} of point {point_id} does not exist",
+            details={"point_id": point_id, "lock_id": lock_id},
+        )
+    return row
+
+
+def check_confirm_token(row: dict, confirm_token: str | None) -> None:
+    """Validate a capability token against a locked slot-lock row."""
+    if confirm_token is None:
+        raise InvalidConfirmTokenError("confirm_token is required")
+    if not secrets.compare_digest(row["confirm_token"], confirm_token):
+        raise InvalidConfirmTokenError("confirm_token does not match")
+
+
+def mark_lock_confirmed(
+    cur: psycopg.Cursor, lock_id: int, reservation_id: int
+) -> dict:
+    """Convert a still-locked row to ``confirmed`` exactly once.
+
+    The caller holds the point row lock and has verified the deadline, so the
+    ``status = 'locked'`` guard can only fail to match if the row changed
+    underneath us — which the row lock makes impossible; it is a
+    belt-and-braces guard for the exactly-once conversion.
+    """
+    row = cur.execute(
+        "UPDATE slot_locks SET status = 'confirmed', reservation_id = %s "
+        f"WHERE id = %s AND status = 'locked' RETURNING {_LOCK_COLS}",
+        (reservation_id, lock_id),
+    ).fetchone()
+    assert row is not None, "lock row changed state while locked"
+    return row
+
+
+def expire_locks(cur: psycopg.Cursor, point_id: int, now: datetime) -> int:
+    """Mark this point's due locks ``expired``; return how many were freed.
+
+    Every capacity-touching write runs this first (while holding the point
+    row lock): an expired lock stops occupying its slot, and the freed
+    capacity becomes available to the waitlist sweep that follows.
+    """
+    rows = cur.execute(
+        "UPDATE slot_locks SET status = 'expired' "
+        "WHERE point_id = %s AND status = 'locked' AND expires_at <= %s "
+        "RETURNING id",
+        (point_id, now),
+    ).fetchall()
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------

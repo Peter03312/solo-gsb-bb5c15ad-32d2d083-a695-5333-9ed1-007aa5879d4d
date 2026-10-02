@@ -7,7 +7,9 @@
 行程的 2～5 站**整体预约**（全站校验通过才一次落库，否则整组回滚并指出
 失败站），以及访客确定行程前的**只读行程规划搜索**（给定有序站点、各站
 停留时长、站间最小间隔与带时区搜索起止，返回按各站开始时刻依次比较最早
-的一组完整行程；无副作用、不占名额、无解返回空结果）。
+的一组完整行程；无副作用、不占名额、无解返回空结果），以及**到访名额
+锁定**（按单站预约同一套窗口规则先锁定一个名额 10 分钟，凭确认凭证在
+到期前原子转为普通预约；过期自动释放并触发候补转正）。
 
 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg 3 · Uvicorn。
 
@@ -54,6 +56,7 @@ docker compose up --build
 | `RESERVATION_MAX_DAYS_AHEAD` | `30` | 预约起点最多可提前的天数 |
 | `RESERVATION_MAX_DURATION_MINUTES` | `120` | 预约最长时长（分钟） |
 | `TRIP_SEARCH_MAX_DAYS` | `7` | 行程规划搜索（`POST /trips/plan`）允许的最大时间跨度（天） |
+| `LOCK_TTL_MINUTES` | `10` | 到访名额锁定的确认期限（分钟）；到期未确认的锁定自动释放 |
 | `DATABASE_URL` | （无，由上面拼装） | 完整 libpq 连接串，**非容器/本地运行时**可直接设置，例如 `postgresql://recycle:recycle@localhost:5432/recycle` |
 
 容器内 API 固定监听 `0.0.0.0:8000`；容器内数据库主机固定为 `db:5432`。
@@ -230,6 +233,31 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     错误沿用预约接口的可区分错误码，并在 `details` 以 `stop_index`（0 基）
     与 `point_id` 指出相关站；站数越界、点重复、时间戳缺时区偏移、负间隔等
     结构错误为 `422 invalid_request`。
+- **到访名额锁定（slot locks）**：访客可按回收点、带时区起止时刻与幂等键
+  申请一次到访名额锁定，服务端签发**锁定号、确认凭证、到期时刻与状态**；
+  锁定的确认期限为 `LOCK_TTL_MINUTES`（默认 **10 分钟**）。
+  - 锁定窗口沿用**单站预约的同一套规则**：未来起点、可约天数
+    （`RESERVATION_MAX_DAYS_AHEAD`）、最长时长
+    （`RESERVATION_MAX_DURATION_MINUTES`）、当前已发布日历的一段连续开放
+    区间、同点容量按半开区间 `[起, 止)` 逐时刻未满；错误语义与预约一致
+    （`invalid_period` / `no_published_version` / `outside_open_hours` /
+    `reservation_overlap`）。
+  - **有效锁定（`locked` 且未到期）按一个名额计入**单站预约、改期、跨点
+    改派、行程各站、规划搜索与候补判断（申请前提与释放转正扫描），与未取消
+    预约同等计数；发布日历、修改时区或**下调容量**同样不得使有效锁定失效
+    （沿用 `reservation_change_conflict` / `capacity_conflict`，`details`
+    附 `conflicting_lock_ids`）。
+  - **确认**：凭确认凭证在到期前调用确认接口，把锁定**原子**转为普通预约
+    （新预约号、新取消凭证、修订号 `1`、所依据规则版本为确认当时的当前
+    版本），响应内嵌该预约；**重复确认返回同一预约**，不延长锁定期；
+    **过期确认明确拒绝**（`409 lock_expired`）。确认在同一回收点行锁下
+    进行，与候补转正串行：到期瞬间确认与转正并发也不会重复占位。
+  - **到期未确认不再占容量**：触及该点容量的写操作（预约创建/取消/改期/
+    改派、行程、候补申请、锁定创建/确认、容量或时区修改）会先清理到期锁定
+    并按申请先后转正候补；规划搜索直接忽略到期锁定。
+  - 幂等键按回收点隔离（与预约/候补/行程键命名空间相互独立）：同点同键
+    同内容重试返回原锁定的当前状态（HTTP 200，含已确认/已过期的最新状
+    态），异内容报 `idempotency_conflict`。
 
 ---
 
@@ -767,7 +795,90 @@ ISO-8601 时刻，统一按 UTC 解释，搜索跨度最多 7 天；
   改窄）；确定行程后请用 `POST /trips` 整体提交，以其实际结果为准。
 - 规划结果里的各站 UTC 起止可直接作为 `POST /trips` 各站 `start`/`end`。
 
-### 4.8 可区分错误码
+### 4.8 名额锁定（slot locks）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/points/{id}/locks` | 申请一次到访名额锁定（201；同点同键同内容重试为 200） |
+| `POST` | `/points/{id}/locks/{lid}/confirm` | 凭确认凭证在到期前把锁定原子转为普通预约（200；重复确认返回同一预约） |
+
+申请请求体（`start`/`end` 为带时区偏移的 ISO-8601 时间戳，按 UTC 解释）：
+
+```json
+{
+  "idempotency_key": "lock-2026-1001-0001",
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T09:30:00Z"
+}
+```
+
+窗口沿用单站预约的同一套校验（未来起点/可约天数/最长时长/当前已发布日历
+的一段连续开放区间/容量按 `[起, 止)` 逐时刻未满，有效锁定与未取消预约
+同等计数）。成功响应（201）：
+
+```json
+{
+  "id": 5,
+  "point_id": 1,
+  "status": "locked",
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T09:30:00Z",
+  "rules_version": 3,
+  "confirm_token": "cQ…",
+  "expires_at": "2026-09-30T08:10:00Z",
+  "created_at": "2026-09-30T08:00:00Z",
+  "reservation": null
+}
+```
+
+- `status`：`locked`（有效，占用一个名额至 `expires_at`）/ `confirmed`
+  （已转为普通预约）/ `expired`（到期未确认，不再占容量）。
+- 同点同键同内容重试返回原锁定的当前状态（HTTP 200，锁定号、确认凭证与
+  到期时刻不变；已确认时 `reservation` 内嵌预约实时快照），异内容返回
+  `409 idempotency_conflict`（`details` 给出已存窗口）。
+- 有效锁定计入单站预约、改期、改派、行程、规划搜索与候补判断的容量；
+  日历/时区变更与下调容量不得使其失效。
+
+确认请求体为 `{ "confirm_token": "…" }`；凭证缺失或错误返回
+`403 invalid_confirm_token`，锁定号不存在或不属于该点返回
+`404 lock_not_found`。到期前确认成功返回 200，`status` 为 `confirmed`，
+`reservation` 内嵌转换出的普通预约（预约号、取消凭证、修订号 `1`、所依据
+规则版本为确认当时的当前版本）：
+
+```json
+{
+  "id": 5,
+  "point_id": 1,
+  "status": "confirmed",
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T09:30:00Z",
+  "rules_version": 3,
+  "confirm_token": "cQ…",
+  "expires_at": "2026-09-30T08:10:00Z",
+  "created_at": "2026-09-30T08:00:00Z",
+  "reservation": {
+    "id": 42,
+    "point_id": 1,
+    "status": "active",
+    "revision": 1,
+    "start": "2026-10-01T09:00:00Z",
+    "end": "2026-10-01T09:30:00Z",
+    "rules_version": 3,
+    "cancel_token": "r9vQ…",
+    "created_at": "2026-09-30T08:05:00Z",
+    "cancelled_at": null
+  }
+}
+```
+
+- **重复确认返回同一预约**（同一预约号与取消凭证），不延长锁定期。
+- 到期后确认返回 `409 lock_expired`（`details` 附 `expires_at` 与 `now`）；
+  过期锁定不再占容量，由下一个触及该点容量的写操作清理并按申请先后转正
+  候补。
+- 转换出的预约是普通预约：可凭其取消凭证取消、改期、改派，同样占用容量
+  并参与候补转正。
+
+### 4.9 可区分错误码
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
@@ -777,18 +888,21 @@ ISO-8601 时刻，统一按 UTC 解释，搜索跨度最多 7 天；
 | 403 | `invalid_cancel_token` | 取消/改期/改派时未提供凭证或凭证不匹配 |
 | 409 | `no_published_version` | 尚无已发布规则（当前版本为 0）就查询日历或创建预约；改派目标点无已发布规则；行程预约/规划搜索任一站点无已发布规则 |
 | 409 | `version_conflict` | `expected_version` 与服务端当前版本不符（`details` 给出双方版本号） |
-| 409 | `idempotency_conflict` | 同一幂等作用域同键提交了不同内容（`details` 给出已存内容；改派作用域为原预约；行程作用域为全局行程键，按完整有序站点内容判重） |
-| 409 | `reservation_overlap` | 请求窗口 `[起, 止)` 内某时刻未取消预约并发数已达到该点容量（创建时；改期时忽略自身；改派时按目标点判定；行程按各站回收点判定）。按 `[起, 止)` 计算，首尾相接不计并发；`details` 给出 `conflicting_reservation_ids`、`capacity`、`peak_concurrency`，行程另附失败站 |
-| 409 | `capacity_conflict` | 下调容量至低于某未来时刻（含进行中预约）未取消预约并发数时拒绝（`details` 给出 `requested_capacity` / `current_capacity` / `future_peak_concurrency`），原容量不变 |
-| 409 | `outside_open_hours` | 预约（或改期/改派后的新窗口、行程任一站窗口）未完整落在相应点当前已发布日历的任一段连续开放区间内 |
+| 409 | `idempotency_conflict` | 同一幂等作用域同键提交了不同内容（`details` 给出已存内容；改派作用域为原预约；行程作用域为全局行程键，按完整有序站点内容判重；锁定作用域为回收点） |
+| 409 | `reservation_overlap` | 请求窗口 `[起, 止)` 内某时刻占用数（未取消预约 + 有效锁定）已达到该点容量（创建预约/锁定时；改期时忽略自身；改派时按目标点判定；行程按各站回收点判定）。按 `[起, 止)` 计算，首尾相接不计并发；`details` 给出 `conflicting_reservation_ids`、`conflicting_lock_ids`、`capacity`、`peak_concurrency`，行程另附失败站 |
+| 409 | `capacity_conflict` | 下调容量至低于某未来时刻（含进行中预约）占用数（未取消预约 + 有效锁定）时拒绝（`details` 给出 `requested_capacity` / `current_capacity` / `future_peak_concurrency`），原容量不变 |
+| 409 | `outside_open_hours` | 预约（或改期/改派后的新窗口、行程任一站窗口、锁定窗口）未完整落在相应点当前已发布日历的任一段连续开放区间内 |
 | 409 | `revision_conflict` | 改期/改派 `expected_revision` 与预约当前修订号不符（`details` 给出双方修订号） |
 | 409 | `reservation_not_reschedulable` | 改期/改派对象已取消或已开始（`details.reason` 区分 `reservation_cancelled` / `reservation_started`） |
-| 409 | `reservation_change_conflict` | 发布规则或修改时区将使未取消预约不再完整开放（`details.conflicting_reservation_ids` 给出冲突预约号） |
+| 409 | `reservation_change_conflict` | 发布规则或修改时区将使未取消预约或有效锁定不再完整开放（`details.conflicting_reservation_ids` / `details.conflicting_lock_ids` 给出冲突编号） |
 | 404 | `waitlist_entry_not_found` | 候补号不存在（或不属于该回收点） |
 | 403 | `invalid_waitlist_token` | 查询/撤回候补时未提供查询密钥或密钥不匹配 |
 | 409 | `waitlist_window_available` | 候补窗口当前空闲可直接预约（请走原预约流程），或不满足候补前提 |
 | 409 | `waitlist_entry_not_active` | 对已转正或已失效的申请执行撤回（排队中撤回与已撤回的重复撤回幂等） |
-| 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限；预约终点不晚于起点、超过最长时长、起点在过去或超出可约天数；候补与改派窗口同样适用预约时段策略；行程站点未按到访先后排列（前站结束晚于后站开始，`details` 附 `stop_index`）；行程规划搜索起止倒置或跨度超过 `TRIP_SEARCH_MAX_DAYS`（默认 7 天）、某站停留分钟数超过现有单站预约时长上限（`details` 附 `stop_index`/`point_id`） |
+| 404 | `lock_not_found` | 锁定号不存在（或不属于该回收点） |
+| 403 | `invalid_confirm_token` | 确认锁定时未提供确认凭证或凭证不匹配 |
+| 409 | `lock_expired` | 锁定已过确认期限（`details` 附 `expires_at` 与 `now`），不能再转为预约 |
+| 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限；预约终点不晚于起点、超过最长时长、起点在过去或超出可约天数；候补、改派与锁定窗口同样适用预约时段策略；行程站点未按到访先后排列（前站结束晚于后站开始，`details` 附 `stop_index`）；行程规划搜索起止倒置或跨度超过 `TRIP_SEARCH_MAX_DAYS`（默认 7 天）、某站停留分钟数超过现有单站预约时长上限（`details` 附 `stop_index`/`point_id`） |
 | 422 | `unknown_timezone` | 无法识别的 IANA 时区 |
 | 422 | `invalid_request` | 请求体结构未通过校验（字段缺失、类型错误、时间戳缺时区偏移、行程站数不在 2～5 等）；改派目标点与原点相同；同一行程内回收点重复；行程规划搜索站数不在 2～5、点重复、负的站间间隔或搜索时间戳缺时区偏移 |
 
@@ -952,6 +1066,39 @@ curl -s -X POST localhost:8000/trips/plan \
 #      {"point_id":2,"start":"<stops[1].start>","end":"<stops[1].end>"}]}
 ```
 
+名额锁定快速体验（回收点 `1` 已发布覆盖该时段的规则）：
+
+```bash
+# 申请一次 10 分钟的到访名额锁定（窗口规则与单站预约一致）
+curl -s -X POST localhost:8000/points/1/locks \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"lock-0001",
+       "start":"2026-10-02T09:00:00Z",
+       "end":"2026-10-02T09:30:00Z"}'
+# -> 201：{"id":5,"status":"locked","confirm_token":"cQ…",
+#    "expires_at":"<创建后 10 分钟>", ...}
+#    有效锁定立即按一个名额计入容量：同窗口再预约/锁定/行程会 409，
+#    候补申请受理，规划搜索会绕开该窗口。
+
+# 到期前凭确认凭证把锁定原子转为普通预约（重复确认返回同一预约）
+curl -s -X POST localhost:8000/points/1/locks/5/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm_token":"<申请响应中的 confirm_token>"}'
+# -> 200：{"status":"confirmed","reservation":{"id":42,
+#    "cancel_token":"r9vQ…","revision":1, ...}, ...}
+#    之后该预约与普通预约一致：可凭 cancel_token 取消/改期/改派。
+
+# 同点同键同内容重试返回原锁定当前状态（200；已确认时内嵌预约快照）
+curl -s -X POST localhost:8000/points/1/locks \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"lock-0001",
+       "start":"2026-10-02T09:00:00Z",
+       "end":"2026-10-02T09:30:00Z"}'
+
+# 到期未确认的锁定不再占容量：过期确认返回 409 lock_expired；
+# 下一个触及该点容量的写操作会清理它并按申请先后转正候补。
+```
+
 ---
 
 ## 6. 本地开发与测试
@@ -1023,6 +1170,17 @@ pytest -q
   尚有余量沿用 `waitlist_window_available`；取消/改期释放与容量上调在
   同事务按申请顺序把放得下的候补逐条转正、放不下继续排队、上调转正失败
   整体回滚（容量与候补状态均不变）；并发预约/取消/扩容下不超配。
+- 名额锁定（本轮）：申请成功返回锁定号/确认凭证/到期时刻/状态、窗口沿用
+  预约错误语义（时段策略/未发布规则/开放区间外/容量满）、同点同键同内容
+  重放与异内容冲突、键按点隔离且与预约键命名空间独立、有效锁定计入单站
+  预约/改期/改派/行程/规划搜索/候补前提与转正（含锁定之间互斥、首尾相接
+  不计）、日历发布/时区修改/下调容量对有效锁定的变更保护（过期后放行）、
+  到期前确认原子转为普通预约（预约号/取消凭证/修订号 1/确认时规则版本、
+  转换后真实占容量、可取消释放）、重复确认返回同一预约且不延长期限、
+  凭证缺失/错误 403、锁定号不存在 404、过期确认 409 `lock_expired`、
+  过期锁定不再占容量且由容量写操作清理并按申请先后转正候补、并发确认
+  恰好转换一次、并发同窗口锁定恰好一个成功、到期瞬间确认与转正并发不
+  重复占位。
 - 全部可区分错误码。
 
 ---
@@ -1033,13 +1191,13 @@ pytest -q
 app/
   config.py      环境变量配置
   schema.sql     PostgreSQL 建表脚本（启动时幂等执行）
-  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派/行程与候补存储（行锁 + 事务 + 释放转正扫描）
+  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派/行程/候补与名额锁定存储（行锁 + 事务 + 释放转正扫描 + 到期锁定清理）
   scheduler.py   纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST/连续开放区间）
   planner.py     纯 Python 只读行程规划引擎（逐站最早可行起点、半开容量满额区间）
   schemas.py     Pydantic 请求响应模型与时段语义校验
   errors.py      可区分错误类型
   main.py        FastAPI 路由与错误处理
-examples/        curl 与 Python 调用示例（含候补、改派与行程全流程）
-tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试（含候补、改派与行程）
+examples/        curl 与 Python 调用示例（含候补、改派、行程与名额锁定全流程）
+tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试（含候补、改派、行程与名额锁定）
 Dockerfile, docker-compose.yml
 ```
