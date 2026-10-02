@@ -21,6 +21,7 @@ from .errors import (
     InvalidPeriodError,
     InvalidRequestError,
     InvalidWaitlistTokenError,
+    LockExpiredError,
     NotFoundError,
     OutsideOpenHoursError,
     ReservationNotReschedulableError,
@@ -44,6 +45,10 @@ from .schemas import (
     ReservationReassignIn,
     ReservationRescheduleIn,
     ReservationStateOut,
+    SlotLockConfirmIn,
+    SlotLockConfirmOut,
+    SlotLockCreateIn,
+    SlotLockOut,
     TripCreateIn,
     TripOut,
     TripPlanIn,
@@ -156,6 +161,7 @@ def patch_point(point_id: int, body: PointUpdateIn) -> PointOut:
     with db.conn() as connection:
         with connection.transaction():
             cur = connection.cursor()
+            now = datetime.now(timezone.utc)
             capacity_increase = False
             if "timezone" in fields or "capacity" in fields:
                 # A timezone change re-interprets every wall-clock rule; it is
@@ -166,6 +172,10 @@ def patch_point(point_id: int, body: PointUpdateIn) -> PointOut:
                 # reservation creations; it also serializes the waitlist
                 # sweep that a capacity increase triggers below.
                 point = db.lock_point(cur, point_id)
+                now = datetime.now(timezone.utc)
+                # Expired holds occupy nothing: sweep before judging a
+                # capacity decrease so they cannot block it.
+                db.expire_overdue_locks(cur, point_id, now)
                 if "timezone" in fields:
                     latest = db.get_latest_payload(cur, point_id)
                     if latest is not None:
@@ -175,9 +185,7 @@ def patch_point(point_id: int, body: PointUpdateIn) -> PointOut:
                 if "capacity" in fields:
                     new_capacity = fields["capacity"]
                     if new_capacity < point["capacity"]:
-                        peak = db.future_peak_concurrency(
-                            cur, point_id, datetime.now(timezone.utc)
-                        )
+                        peak = db.future_peak_concurrency(cur, point_id, now)
                         if peak > new_capacity:
                             raise CapacityConflictError(
                                 f"capacity of point {point_id} cannot be lowered "
@@ -195,16 +203,15 @@ def patch_point(point_id: int, body: PointUpdateIn) -> PointOut:
             row = db.update_point(cur, point_id, **fields)
             if capacity_increase:
                 # Newly opened capacity: in the same transaction, promote the
-                # earliest waitlist entries that now fit.  If the sweep
-                # fails, the capacity change rolls back together with it.
+                # earliest waitlist entries that now fit (expired locks were
+                # already swept above).  If the sweep fails, the capacity
+                # change rolls back together with it.
                 latest = db.get_latest_payload(cur, point_id)
                 if latest is not None:
                     point["capacity"] = row["capacity"]
                     if "timezone" in fields:
                         point["timezone"] = row["timezone"]
-                    db.promote_waitlist(
-                        cur, point, latest, datetime.now(timezone.utc)
-                    )
+                    db.promote_waitlist(cur, point, latest, now)
     return PointOut(**row)
 
 
@@ -395,21 +402,40 @@ def _reservation_state_out(row: dict) -> ReservationStateOut:
     )
 
 
+def _expire_locks_and_promote(cur, point: dict, now: datetime) -> None:
+    """Expire overdue locks, then promote waitlist entries in existing order.
+
+    Every capacity-touching write runs this first while holding the point
+    row lock: expired holds stop occupying capacity, and the released slots
+    go through the same application-ordered waitlist sweep as an ordinary
+    release.  With nothing expiring there is no release, so the queue is
+    left untouched.
+    """
+    expired = db.expire_overdue_locks(cur, point["id"], now)
+    if expired:
+        latest = db.get_latest_payload(cur, point["id"])
+        if latest is not None:
+            db.promote_waitlist(cur, point, latest, now)
+
+
 def _assert_window_has_capacity(
     cur,
     point: dict,
     start: datetime,
     end: datetime,
     *,
+    now: datetime,
     exclude_reservation_id: int | None = None,
 ) -> None:
     """Reject a window unless every instant of ``[start, end)`` is below cap.
 
-    Capacity counts non-cancelled reservations by the half-open interval rule:
-    touching end-to-end is free and a reservation starting exactly at ``start``
-    is already counted.  The refusal keeps the existing
+    Capacity counts non-cancelled reservations together with valid (held,
+    unexpired) slot locks by the half-open interval rule: touching
+    end-to-end is free and a booking starting exactly at ``start`` is
+    already counted.  The refusal keeps the existing
     ``reservation_overlap`` error code and its ``conflicting_reservation_ids``
-    detail, extended with the point's capacity and the window's peak.
+    detail, extended with the point's capacity, the window's peak and the
+    ids of the conflicting held locks.
     """
     peak = db.window_peak_concurrency(
         cur,
@@ -417,6 +443,7 @@ def _assert_window_has_capacity(
         start,
         end,
         exclude_reservation_id=exclude_reservation_id,
+        as_of=now,
     )
     if peak >= point["capacity"]:
         overlapping = db.find_overlapping(
@@ -426,10 +453,14 @@ def _assert_window_has_capacity(
             end,
             exclude_reservation_id=exclude_reservation_id,
         )
+        overlapping_locks = db.find_overlapping_held_locks(
+            cur, point["id"], start, end, as_of=now
+        )
         raise ReservationOverlapError(
             "reservation window is at the point's capacity for some instant",
             details={
                 "conflicting_reservation_ids": [r["id"] for r in overlapping],
+                "conflicting_lock_ids": [lock["id"] for lock in overlapping_locks],
                 "capacity": point["capacity"],
                 "peak_concurrency": peak,
             },
@@ -511,7 +542,11 @@ def create_reservation(
                     },
                 )
 
-            _assert_window_has_capacity(cur, point, start, end)
+            # Expired holds stop occupying capacity before this write is
+            # judged; any slots they released go to the waitlist in the
+            # existing application order, all in this transaction.
+            _expire_locks_and_promote(cur, point, now)
+            _assert_window_has_capacity(cur, point, start, end, now=now)
 
             row = db.insert_reservation(
                 cur,
@@ -539,18 +574,20 @@ def cancel_reservation(
             # path) so the subsequent waitlist sweep is race-free against
             # concurrent booking, rescheduling and rule publication.
             point = db.lock_point(cur, point_id)
+            now = datetime.now(timezone.utc)
+            # Expire overdue holds first: slots freed by expirations and by
+            # this cancellation are handled together by one application-
+            # ordered waitlist sweep, all in this transaction.
+            expired = db.expire_overdue_locks(cur, point_id, now)
             row, released = db.cancel_reservation(
                 cur, point_id, reservation_id, body.cancel_token
             )
-            if released:
-                # A slot actually opened: promote, in application order, every
-                # waitlist entry that now fits, all in the same
-                # transaction.  If a promotion fails, the cancellation is
-                # rolled back together with the sweep.
+            if released or expired:
+                # Promote, in application order, every waitlist entry that
+                # now fits, all in the same transaction.  If a promotion
+                # fails, the cancellation rolls back together with the sweep.
                 _, rules_row = db.get_current_rules(cur, point_id)
-                db.promote_waitlist(
-                    cur, point, rules_row, datetime.now(timezone.utc)
-                )
+                db.promote_waitlist(cur, point, rules_row, now)
     return _reservation_state_out(row)
 
 
@@ -687,10 +724,18 @@ def reschedule_reservation(
                     },
                 )
 
-            # Capacity against other active reservations; this reservation's
-            # own (still held) old window is ignored.
+            # Capacity against other active reservations and still-held
+            # locks; this reservation's own (still held) old window is
+            # ignored.  Expired holds are swept first and may already have
+            # promoted waitlist entries in this same transaction.
+            _expire_locks_and_promote(cur, point, now)
             _assert_window_has_capacity(
-                cur, point, start, end, exclude_reservation_id=resv["id"]
+                cur,
+                point,
+                start,
+                end,
+                now=now,
+                exclude_reservation_id=resv["id"],
             )
 
             attempt = db.apply_reschedule(
@@ -870,7 +915,11 @@ def reassign_reservation(
                         "rules_version": target_rules["version"],
                     },
                 )
-            _assert_window_has_capacity(cur, target_point, start, end)
+            # Sweep the target point first: expired holds stop occupying the
+            # target capacity and may promote its waitlist before this
+            # reassign claims a slot, all in this transaction.
+            _expire_locks_and_promote(cur, target_point, now)
+            _assert_window_has_capacity(cur, target_point, start, end, now=now)
 
             # All validations passed: cancel the source reservation (this
             # releases its window) and, per the existing release rules, try
@@ -879,6 +928,9 @@ def reassign_reservation(
                 cur, point_id, reservation_id, body.cancel_token
             )
             assert released  # status was verified "active" above
+            # Sweep the origin point's expired holds together with the
+            # released window, then promote its waitlist in application order.
+            db.expire_overdue_locks(cur, point_id, now)
             _, source_rules = db.get_current_rules(cur, point_id)
             db.promote_waitlist(cur, source_point, source_rules, now)
 
@@ -908,6 +960,209 @@ def reassign_reservation(
             # transaction, leaving the source reservation and the target
             # point's occupancy untouched.
             return _reassign_out(cancelled, new_reservation, target_rules["version"])
+
+
+# ---------------------------------------------------------------------------
+# Slot locks (到访名额锁定) — ten-minute holds convertible to a reservation
+# ---------------------------------------------------------------------------
+
+def _lock_out(row: dict) -> SlotLockOut:
+    return SlotLockOut(
+        id=row["id"],
+        point_id=row["point_id"],
+        status=row["status"],
+        start=utc_iso(row["start_utc"]),
+        end=utc_iso(row["end_utc"]),
+        rules_version=row["rules_version"],
+        confirm_token=row["confirm_token"],
+        expires_at=utc_iso(row["expires_at"]),
+        created_at=row["created_at"],
+        confirmed_at=row["confirmed_at"],
+        reservation_id=row["reservation_id"],
+    )
+
+
+@app.post(
+    "/points/{point_id}/locks",
+    response_model=SlotLockOut,
+    status_code=201,
+    tags=["locks"],
+)
+def create_slot_lock(
+    point_id: int, body: SlotLockCreateIn, response: Response
+) -> SlotLockOut:
+    """Hold one capacity slot for ten minutes.
+
+    The window follows the same single-station booking policy as an ordinary
+    reservation (lead time, maximum duration, one continuous open interval of
+    the currently published calendar, half-open capacity).  A held lock
+    counts as one slot for reservations, trips, waitlist admission and trip
+    planning until it expires or is confirmed.  Same point + same
+    idempotency key + same content replays the original lock state;
+    different content conflicts.
+    """
+    start = body.start.astimezone(timezone.utc)
+    end = body.end.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            point = db.lock_point(cur, point_id)
+
+            # Idempotency replay precedes the expiry sweep, mirroring the
+            # reservation endpoint: the first successful request wins and
+            # its stored state (which may now be confirmed or expired) is
+            # returned as-is.
+            existing = db.get_lock_by_key(cur, point_id, body.idempotency_key)
+            if existing is not None:
+                if existing["start_utc"] == start and existing["end_utc"] == end:
+                    # A replay is itself a capacity-touching request: if the
+                    # original hold has since crossed its deadline, sweep it
+                    # (and promote the queue) before reporting its live
+                    # state, so the retry cannot advertise a stale "held".
+                    if (
+                        existing["status"] == "held"
+                        and existing["expires_at"] <= now
+                    ):
+                        _expire_locks_and_promote(cur, point, now)
+                        existing = db.get_lock_by_key(
+                            cur, point_id, body.idempotency_key
+                        )
+                    response.status_code = 200
+                    return _lock_out(existing)
+                raise IdempotencyConflictError(
+                    f"lock idempotency key {body.idempotency_key!r} was already "
+                    f"used on point {point_id} with a different time window",
+                    details={
+                        "lock_id": existing["id"],
+                        "start": utc_iso(existing["start_utc"]),
+                        "end": utc_iso(existing["end_utc"]),
+                    },
+                )
+
+            validate_reservation_window(
+                start,
+                end,
+                now,
+                max_days_ahead=settings.reservation_max_days_ahead,
+                max_duration=timedelta(
+                    minutes=settings.reservation_max_duration_minutes
+                ),
+            )
+            _, rules_row = db.get_current_rules(cur, point_id)
+            zone = get_zone(point["timezone"])
+            ruleset = payload_to_ruleset(rules_row["payload"])
+            date_from = (start - timedelta(days=1)).astimezone(zone).date()
+            date_to = (end + timedelta(days=1)).astimezone(zone).date()
+            intervals = build_open_intervals(
+                point["timezone"], ruleset, date_from, date_to
+            )
+            if not any(s <= start and end <= e for s, e in intervals):
+                raise OutsideOpenHoursError(
+                    "lock window is not fully contained in one continuous "
+                    "open interval of the published calendar",
+                    details={
+                        "start": utc_iso(start),
+                        "end": utc_iso(end),
+                        "rules_version": rules_row["version"],
+                    },
+                )
+
+            # Expired holds free their slots and promote the waitlist in
+            # application order before this hold claims one.
+            _expire_locks_and_promote(cur, point, now)
+            _assert_window_has_capacity(cur, point, start, end, now=now)
+
+            expires_at = now + timedelta(seconds=settings.lock_ttl_seconds)
+            row = db.insert_slot_lock(
+                cur,
+                point_id=point_id,
+                idempotency_key=body.idempotency_key,
+                start_utc=start,
+                end_utc=end,
+                rules_version=rules_row["version"],
+                expires_at=expires_at,
+            )
+    return _lock_out(row)
+
+
+@app.post(
+    "/points/{point_id}/locks/{lock_id}/confirm",
+    response_model=SlotLockConfirmOut,
+    tags=["locks"],
+)
+def confirm_slot_lock(
+    point_id: int, lock_id: int, body: SlotLockConfirmIn
+) -> SlotLockConfirmOut:
+    """Atomically convert a held, unexpired lock into an ordinary reservation.
+
+    A repeat confirmation returns the same reservation without extending the
+    hold.  Confirmation after the deadline is refused with
+    ``lock_expired``; expiry and waitlist promotion are processed first, and
+    every involved row is taken under the point lock, so an exactly-at-the-
+    deadline confirmation and a concurrent promotion cannot occupy the same
+    slot twice.
+    """
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            # Point lock first, then the lock row: this serializes against
+            # reservation creation, waitlist promotion and every other
+            # capacity-touching write, so the conversion and a promotion
+            # racing it at the deadline cannot double-occupy.
+            point = db.lock_point(cur, point_id)
+            lock = db.get_lock_for_update(cur, point_id, lock_id)
+            db.check_lock_token(lock, body.confirm_token)
+
+            if lock["status"] == "confirmed":
+                # Idempotent replay: the same reservation, and the original
+                # ten-minute hold is not extended.
+                reservation = db.get_reservation_by_id(cur, lock["reservation_id"])
+                return SlotLockConfirmOut(
+                    lock=_lock_out(lock), reservation=_reservation_out(reservation)
+                )
+
+            # Sweep every overdue hold (this row included) before judging:
+            # a lock expiring at this exact instant is updated to ``expired``
+            # under the row lock and can no longer confirm.  Slots freed by
+            # expirations go to the waitlist in the existing order.
+            _expire_locks_and_promote(cur, point, now)
+            lock = db.get_lock_for_update(cur, point_id, lock_id)
+            if lock["status"] == "expired":
+                raise LockExpiredError(
+                    f"slot lock {lock_id} expired at "
+                    f"{utc_iso(lock['expires_at'])} and can no longer be "
+                    f"confirmed",
+                    details={
+                        "point_id": point_id,
+                        "lock_id": lock_id,
+                        "expires_at": utc_iso(lock["expires_at"]),
+                        "now": utc_iso(now),
+                    },
+                )
+
+            # Convert atomically against the rules version currently
+            # published at confirmation time: insert the reservation with a
+            # server-side key, then link the lock row.  Both live in this one
+            # transaction, so an error leaves the hold in place instead of
+            # half-booking the slot.  The converting lock stayed held
+            # throughout the sweep above and therefore kept its own slot.
+            latest = db.get_latest_payload(cur, point_id)
+            reservation = db.insert_reservation(
+                cur,
+                point_id,
+                f"__slot_lock__:{lock_id}:{secrets.token_urlsafe(16)}",
+                lock["start_utc"],
+                lock["end_utc"],
+                latest["version"] if latest is not None else lock["rules_version"],
+            )
+            confirmed = db.mark_lock_confirmed(cur, lock, reservation["id"])
+            result = SlotLockConfirmOut(
+                lock=_lock_out(confirmed),
+                reservation=_reservation_out(reservation),
+            )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1017,11 +1272,14 @@ def create_waitlist_entry(
 
             # The waitlist is only for calendar-valid windows that are
             # already at capacity: some instant of the window must be holding
-            # as many non-cancelled reservations as the point allows.  A
-            # window with room to spare keeps going through the ordinary
-            # reservation flow.  Capacity follows the half-open [start, end)
-            # rule, so a window that merely touches active reservations is still free.
-            peak = db.window_peak_concurrency(cur, point_id, start, end)
+            # as many non-cancelled reservations/valid locks as the point
+            # allows.  A window with room to spare keeps going through the
+            # ordinary reservation flow.  Capacity follows the half-open
+            # [start, end) rule, so a window that merely touches active
+            # bookings is still free.  Expired holds are swept first and
+            # their freed slots go to the queue in application order.
+            _expire_locks_and_promote(cur, point, now)
+            peak = db.window_peak_concurrency(cur, point_id, start, end, as_of=now)
             if peak < point["capacity"]:
                 raise WaitlistWindowAvailableError(
                     "the requested window currently has free capacity; use "
@@ -1246,6 +1504,10 @@ def create_trip(body: TripCreateIn, response: Response) -> TripOut:
             # interval of the currently published calendar, per-point
             # capacity over [start, end)).  The first failure aborts the
             # whole group: the transaction rolls back and nothing is stored.
+            # Each point's expired holds are swept just before its own
+            # capacity check (points are distinct within a trip), and slots
+            # they release go to that point's waitlist in application order.
+            swept: set[int] = set()
             plan = []
             for index, stop in enumerate(body.stops):
                 start, end = windows[index]
@@ -1279,7 +1541,10 @@ def create_trip(body: TripCreateIn, response: Response) -> TripOut:
                                 "rules_version": rules_row["version"],
                             },
                         )
-                    _assert_window_has_capacity(cur, point, start, end)
+                    if stop.point_id not in swept:
+                        _expire_locks_and_promote(cur, point, now)
+                        swept.add(stop.point_id)
+                    _assert_window_has_capacity(cur, point, start, end, now=now)
                 except ApiError as exc:
                     raise _stop_scoped(exc, index, stop.point_id)
                 plan.append(
@@ -1425,7 +1690,11 @@ def plan_trip(body: TripPlanIn) -> TripPlanOut:
                         raise _stop_scoped(exc, index, stop.point_id)
                     windows = (
                         db.get_active_reservation_windows(
-                            cur, stop.point_id, lower, upper_end
+                            cur,
+                            stop.point_id,
+                            lower,
+                            upper_end,
+                            as_of=now,
                         )
                         if lower < upper_end
                         else []

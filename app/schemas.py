@@ -138,6 +138,30 @@ class WaitlistCreateIn(BaseModel):
         return value
 
 
+class SlotLockCreateIn(BaseModel):
+    """Ten-minute slot-lock request (到访名额锁定): window + idempotency key."""
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T09:00:00Z)"
+            )
+        return value
+
+
+class SlotLockConfirmIn(BaseModel):
+    """Body of the confirmation endpoint: the lock's capability token."""
+
+    confirm_token: str | None = None
+
+
 class WaitlistTokenIn(BaseModel):
     """Body of the withdraw endpoint; also used for token-bearing queries."""
 
@@ -480,6 +504,40 @@ class WaitlistOut(BaseModel):
     query_token: str
     created_at: datetime
     reservation: ReservationOut | None = None
+
+
+class SlotLockOut(BaseModel):
+    """State of a ten-minute slot lock (到访名额锁定).
+
+    ``status`` is ``held`` while the lock occupies one slot (until
+    ``expires_at``), ``confirmed`` once it has been converted into the
+    reservation named by ``reservation_id``, or ``expired`` once the TTL
+    elapsed without confirmation (the lock then occupies nothing).
+    """
+
+    id: int
+    point_id: int
+    status: str
+    start: str
+    end: str
+    rules_version: int
+    confirm_token: str
+    expires_at: str
+    created_at: datetime
+    confirmed_at: datetime | None
+    reservation_id: int | None = None
+
+
+class SlotLockConfirmOut(BaseModel):
+    """Result of confirming a lock: the lock state and the ordinary reservation.
+
+    The confirmation atomically converts the held lock into a normal
+    reservation; ``reservation`` carries the new reservation number and the
+    cancel token used by the existing cancel/reschedule/reassign endpoints.
+    """
+
+    lock: SlotLockOut
+    reservation: ReservationOut
 
 
 class ReassignOut(BaseModel):

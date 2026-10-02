@@ -149,3 +149,29 @@ class WaitlistEntryNotActiveError(ApiError):
 
     status_code = 409
     code = "waitlist_entry_not_active"
+
+
+# ---------------------------------------------------------------------------
+# Slot locks (到访名额锁定)
+# ---------------------------------------------------------------------------
+
+
+class LockNotFoundError(ApiError):
+    """Lock number does not exist (or does not belong to this point)."""
+
+    status_code = 404
+    code = "lock_not_found"
+
+
+class InvalidLockTokenError(ApiError):
+    """Confirmation presented no or a wrong capability token."""
+
+    status_code = 403
+    code = "invalid_lock_token"
+
+
+class LockExpiredError(ApiError):
+    """The ten-minute hold has expired and can no longer be confirmed."""
+
+    status_code = 409
+    code = "lock_expired"

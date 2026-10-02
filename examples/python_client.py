@@ -326,6 +326,70 @@ def main() -> None:
     show("waitlist entry is now promoted and carries the reservation", status, w_state)
 
     # ------------------------------------------------------------------
+    # Slot locks (到访名额锁定): hold one slot for ten minutes, then
+    # confirm the hold into an ordinary reservation.
+    # ------------------------------------------------------------------
+    status, lock_point = call(
+        "POST", "/points", {"name": "锁定演示点", "timezone": "UTC", "capacity": 1}
+    )
+    lpid = lock_point["id"]
+    call(
+        "POST",
+        f"/points/{lpid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": weekday, "start_time": "08:00", "end_time": "12:00"}
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+
+    lock_body = {
+        "idempotency_key": "lock-demo-1",
+        "start": f"{tomorrow}T11:00:00Z",
+        "end": f"{tomorrow}T11:30:00Z",
+    }
+    status, held = call("POST", f"/points/{lpid}/locks", lock_body)
+    show("hold the 11:00-11:30 slot for ten minutes", status, held)
+    lid, lock_token = held["id"], held["confirm_token"]
+
+    status, replay = call("POST", f"/points/{lpid}/locks", lock_body)
+    show("same key + same content replays the original lock", status, replay)
+
+    status, clash = call(
+        "POST",
+        f"/points/{lpid}/reservations",
+        {
+            "idempotency_key": "lock-demo-competitor",
+            "start": f"{tomorrow}T11:15:00Z",
+            "end": f"{tomorrow}T11:45:00Z",
+        },
+    )
+    show("the held lock counts as one slot -> reservation_overlap", status, clash)
+
+    status, confirmed = call(
+        "POST", f"/points/{lpid}/locks/{lid}/confirm",
+        {"confirm_token": lock_token},
+    )
+    show("confirm the lock: it becomes a normal reservation", status, confirmed)
+
+    status, again = call(
+        "POST", f"/points/{lpid}/locks/{lid}/confirm",
+        {"confirm_token": lock_token},
+    )
+    show("repeat confirmation returns the same reservation", status, again)
+
+    status, denied = call(
+        "POST", f"/points/{lpid}/locks/999999/confirm",
+        {"confirm_token": lock_token},
+    )
+    show("unknown lock number -> 404 lock_not_found", status, denied)
+
+    # ------------------------------------------------------------------
     # Reassign (改派): move a visit to another recycling point.
     # A second point with its own published calendar acts as the target.
     # ------------------------------------------------------------------

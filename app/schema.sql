@@ -200,3 +200,43 @@ CREATE TABLE IF NOT EXISTS trip_stops (
 
 CREATE INDEX IF NOT EXISTS idx_trip_stops_reservation
     ON trip_stops (reservation_id);
+
+-- Slot locks (到访名额锁定).  A visitor may hold one capacity slot for ten
+-- minutes before committing to an ordinary reservation.  A held lock occupies
+-- exactly one slot under the same half-open [start, end) capacity rule as an
+-- active reservation; confirming it before ``expires_at`` atomically converts
+-- the row into an ordinary reservation, while a lock left unconfirmed past
+-- its expiry occupies nothing (it is filtered out by every capacity query and
+-- marked ``expired`` by the sweep run at the start of capacity-touching
+-- writes).  (point_id, idempotency_key) is the idempotency scope, mirroring
+-- reservations: same key + same content replays the original lock state,
+-- different content conflicts.
+--
+-- status lifecycle:
+--   held      -- the ten-minute hold is in effect and occupies one slot
+--   confirmed -- converted into the reservation named by reservation_id
+--   expired   -- expires_at passed without confirmation; occupies nothing
+CREATE TABLE IF NOT EXISTS slot_locks (
+    id              BIGSERIAL PRIMARY KEY,
+    point_id        BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    start_utc       TIMESTAMPTZ NOT NULL,
+    end_utc         TIMESTAMPTZ NOT NULL,
+    rules_version   INTEGER NOT NULL,        -- published version validated at hold time
+    confirm_token   TEXT NOT NULL,           -- capability token for confirmation
+    status          TEXT NOT NULL DEFAULT 'held'
+                    CHECK (status IN ('held', 'confirmed', 'expired')),
+    expires_at      TIMESTAMPTZ NOT NULL,    -- server-side ten-minute TTL deadline
+    reservation_id  BIGINT REFERENCES reservations(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    confirmed_at    TIMESTAMPTZ,
+    UNIQUE (point_id, idempotency_key)
+);
+
+-- Capacity queries only ever consider locks that are still held and unexpired.
+CREATE INDEX IF NOT EXISTS idx_slot_locks_point_held
+    ON slot_locks (point_id, start_utc)
+    WHERE status = 'held';
+
+CREATE INDEX IF NOT EXISTS idx_slot_locks_reservation
+    ON slot_locks (reservation_id);

@@ -607,3 +607,62 @@ api POST /trips/plan "{
   \"search_from\": \"${D1}T00:00:00Z\",
   \"search_to\": \"${D8}T00:00:00Z\"
 }"
+
+echo
+echo "== Slot locks (到访名额锁定): hold one slot for ten minutes =="
+echo "-- hold 11:00-11:30 UTC tomorrow (201; returns lock number, confirm"
+echo "   credential, expires_at and held status) --"
+LOCK_JSON="$(api POST "/points/$RPID/locks" "{
+  \"idempotency_key\": \"demo-lock-1\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}")"
+echo "$LOCK_JSON"
+LID="$(echo "$LOCK_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+LTOKEN="$(echo "$LOCK_JSON" | sed -n 's/.*"confirm_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- same point + same key + same content replays the lock (200) --"
+api POST "/points/$RPID/locks" "{
+  \"idempotency_key\": \"demo-lock-1\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- same key, different window -> 409 idempotency_conflict --"
+api POST "/points/$RPID/locks" "{
+  \"idempotency_key\": \"demo-lock-1\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:20:00Z\"
+}"
+
+echo
+echo "-- the held lock reserves one slot: an overlapping reservation is 409 --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-lock-competitor\",
+  \"start\": \"${D1}T11:15:00Z\",
+  \"end\": \"${D1}T11:45:00Z\"
+}"
+
+echo
+echo "-- but a window merely touching it [start, end) books fine --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-lock-toucher\",
+  \"start\": \"${D1}T11:30:00Z\",
+  \"end\": \"${D1}T11:45:00Z\"
+}"
+
+echo
+echo "-- confirm before the deadline: the lock becomes an ordinary reservation --"
+CONFIRM_JSON="$(api POST "/points/$RPID/locks/$LID/confirm" "{\"confirm_token\": \"$LTOKEN\"}")"
+echo "$CONFIRM_JSON"
+
+echo
+echo "-- repeat confirmation returns the same reservation (no deadline extension) --"
+api POST "/points/$RPID/locks/$LID/confirm" "{\"confirm_token\": \"$LTOKEN\"}"
+
+echo
+echo "-- wrong credential -> 403 invalid_lock_token; unknown number -> 404 lock_not_found --"
+api POST "/points/$RPID/locks/$LID/confirm" '{"confirm_token": "wrong"}'
+api POST "/points/$RPID/locks/999999/confirm" "{\"confirm_token\": \"$LTOKEN\"}"
